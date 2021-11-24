@@ -1,4 +1,4 @@
-__version__ = '1.1.0'
+__version__ = '1.1.0+smth'
 
 import numpy as np
 import pyrep

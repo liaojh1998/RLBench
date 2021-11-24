@@ -7,9 +7,24 @@ from pyrep import PyRep
 from pyrep.const import ObjectType, ConfigurationPathAlgorithms
 from pyrep.errors import IKError
 from pyrep.objects import Dummy
-
+import json
 from rlbench import utils
+import os
+import cv2
+import sys
+import importlib
+import torch
+import torchvision
+from rlbench.transforms_video import *
+import numpy as np
+import io
+import base64
+from PIL import Image
+from rlbench.utils_smth import load_json_config, remove_module_from_checkpoint_state_dict
+from torchvision import transforms
 from rlbench.action_modes import ArmActionMode, ActionMode
+from rlbench.models.multi_column import MultiColumn
+
 from rlbench.backend.exceptions import BoundaryError, WaypointError
 from rlbench.backend.observation import Observation
 from rlbench.backend.robot import Robot
@@ -23,6 +38,13 @@ _DT = 0.05
 _MAX_RESET_ATTEMPTS = 40
 _MAX_DEMO_ATTEMPTS = 10
 
+def config_init(config):
+    """ Some of the variables that should exist and contain default values """
+    if "augmentation_mappings_json" not in config:
+        config["augmentation_mappings_json"] = None
+    if "augmentation_types_todo" not in config:
+        config["augmentation_types_todo"] = None
+    return config
 
 class InvalidActionError(Exception):
     pass
@@ -52,11 +74,21 @@ class TaskEnvironment(object):
         self._reset_called = False
         self._prev_ee_velocity = None
         self._enable_path_observations = False
-
+        self.classifier_config_file_path = "/srv/data/cross-modal-concept2robot/models/something-something-v2-baseline/configs/pretrained/config_model1.json"
+        self.classifier_config = load_json_config(self.classifier_config_file_path)
+        checkpoint_path = "/srv/data/model_best.pth.tar"
+        column_cnn_def = importlib.import_module("{}".format(str("rlbench." + self.classifier_config['conv_model'])))
+        self.classifier_model = MultiColumn(self.classifier_config['num_classes'], column_cnn_def.Model, int(self.classifier_config["column_units"]))
+        checkpoint = torch.load(checkpoint_path, map_location='cuda:0')
+        checkpoint['state_dict'] = remove_module_from_checkpoint_state_dict(
+                                              checkpoint['state_dict'])
+        self.classifier_model.load_state_dict(checkpoint['state_dict'])
         self._scene.load(self._task)
         self._pyrep.start()
         self._robot_shapes = self._robot.arm.get_objects_in_tree(
             object_type=ObjectType.SHAPE)
+
+        self.previous_steps = []
 
     def get_name(self) -> str:
         return self._task.get_name()
@@ -368,6 +400,47 @@ class TaskEnvironment(object):
 
         success, terminate = self._task.success()
         task_reward = self._task.reward()
+
+        transform_eval_pre = ComposeMix([
+        [Scale(self.classifier_config['input_spatial_size']), "img"],
+        [torchvision.transforms.ToPILImage(), "img"],
+        [torchvision.transforms.CenterCrop(self.classifier_config['input_spatial_size']), "img"]
+         ])
+
+        transform_post = ComposeMix([
+        [torchvision.transforms.ToTensor(), "img"],
+        [torchvision.transforms.Normalize(
+                   mean=[0.485, 0.456, 0.406],  # default values for imagenet
+                   std=[0.229, 0.224, 0.225]), "img"]
+         ])
+
+
+        front_rgb_image = self._scene.get_observation().front_rgb
+
+        #img = Image.fromarray(front_rgb_image, 'RGB')
+
+        convert_tensor = transforms.ToTensor()
+        self.previous_steps.append(front_rgb_image)
+
+        transformed_img = transform_eval_pre(self.previous_steps)
+        transformed_img = transform_post(transformed_img)
+
+        #replay_video = np.array(self.previous_steps)
+        #replay_video = torch.cat(self.previous_steps)
+        #replay_video = replay_video.unsqueeze(0)
+        #replay_video = replay_video.unsqueeze(1)
+        replay_video = transformed_img
+
+        convert_tensor = transforms.ToTensor()
+
+        #replay_video = convert_tensor(replay_video)
+        replay_video = torch.cat(replay_video)
+        #input_tensor = torch.autograd.Variable(torch.rand(5, 3, 72, 84, 84))
+        print(replay_video.shape)
+        classifier_output = self.classifier_model(replay_video)
+
+        print(classifier_output.shape)
+
         reward = float(success) if task_reward is None else task_reward
         return self._scene.get_observation(), reward, terminate
 

@@ -19,6 +19,7 @@ from rlbench.transforms_video import *
 import numpy as np
 import io
 import base64
+import os
 from PIL import Image
 from rlbench.utils_smth import load_json_config, remove_module_from_checkpoint_state_dict
 from torchvision import transforms
@@ -74,21 +75,38 @@ class TaskEnvironment(object):
         self._reset_called = False
         self._prev_ee_velocity = None
         self._enable_path_observations = False
-        self.classifier_config_file_path = "/srv/data/cross-modal-concept2robot/models/something-something-v2-baseline/configs/pretrained/config_model1.json"
-        self.classifier_config = load_json_config(self.classifier_config_file_path)
-        checkpoint_path = "/srv/data/model_best.pth.tar"
-        column_cnn_def = importlib.import_module("{}".format(str("rlbench." + self.classifier_config['conv_model'])))
-        self.classifier_model = MultiColumn(self.classifier_config['num_classes'], column_cnn_def.Model, int(self.classifier_config["column_units"]))
-        checkpoint = torch.load(checkpoint_path, map_location='cuda:0')
-        checkpoint['state_dict'] = remove_module_from_checkpoint_state_dict(
-                                              checkpoint['state_dict'])
-        self.classifier_model.load_state_dict(checkpoint['state_dict'])
+
         self._scene.load(self._task)
         self._pyrep.start()
         self._robot_shapes = self._robot.arm.get_objects_in_tree(
             object_type=ObjectType.SHAPE)
 
-        self.previous_steps = []
+        # Sth-sth Classifier
+        self._classifier_config_file_path = "/srv/data/cross-modal-concept2robot/models/something-something-v2-baseline/configs/pretrained/config_model1.json"
+        self._classifier_config = load_json_config(self._classifier_config_file_path)
+        checkpoint_path = os.path.join(self._classifier_config['output_dir'],
+                self._classifier_config['model_name'], 'model_best.pth.tar')
+        column_cnn_def = importlib.import_module("{}".format(str("rlbench." + self._classifier_config['conv_model'])))
+        self._device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self._classifier_model = MultiColumn(self._classifier_config['num_classes'],
+                column_cnn_def.Model, int(self._classifier_config["column_units"])).to(self._device)
+        checkpoint = torch.load(checkpoint_path, map_location=self._device)
+        checkpoint['state_dict'] = remove_module_from_checkpoint_state_dict(
+                                              checkpoint['state_dict'])
+        self._classifier_model.load_state_dict(checkpoint['state_dict'])
+        self._classifier_model.eval()
+        self._transform_eval_pre = ComposeMix([
+            [Scale(self._classifier_config['input_spatial_size']), "img"],
+            [torchvision.transforms.ToPILImage(), "img"],
+            [torchvision.transforms.CenterCrop(self._classifier_config['input_spatial_size']), "img"]
+        ])
+        self._transform_post = ComposeMix([
+            [torchvision.transforms.ToTensor(), "img"],
+            [torchvision.transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],  # default values for imagenet
+                std=[0.229, 0.224, 0.225]), "img"]
+        ])
+        self._previous_steps = []
 
     def get_name(self) -> str:
         return self._task.get_name()
@@ -401,45 +419,23 @@ class TaskEnvironment(object):
         success, terminate = self._task.success()
         task_reward = self._task.reward()
 
-        transform_eval_pre = ComposeMix([
-        [Scale(self.classifier_config['input_spatial_size']), "img"],
-        [torchvision.transforms.ToPILImage(), "img"],
-        [torchvision.transforms.CenterCrop(self.classifier_config['input_spatial_size']), "img"]
-         ])
-
-        transform_post = ComposeMix([
-        [torchvision.transforms.ToTensor(), "img"],
-        [torchvision.transforms.Normalize(
-                   mean=[0.485, 0.456, 0.406],  # default values for imagenet
-                   std=[0.229, 0.224, 0.225]), "img"]
-         ])
-
-
+        # Sth-sth Classifier Rewards
         front_rgb_image = self._scene.get_observation().front_rgb
+        self._previous_steps.append(front_rgb_image)
 
-        #img = Image.fromarray(front_rgb_image, 'RGB')
+        with torch.set_grad_enabled(False):
+            if len(self._previous_steps) == 72:  # 72 is the example length per clip
+                replay = self._transform_eval_pre(self._previous_steps)
+                replay = self._transform_post(replay)
+                replay = torch.stack(replay, dim=0)
+                replay = torch.transpose(replay, 0, 1)
+                replay = replay.unsqueeze(0)
+                replay = [replay.to(self._device)]
+                classifier_output = self._classifier_model(replay)
+                classifier_output = classifier_output.squeeze(0)
 
-        convert_tensor = transforms.ToTensor()
-        self.previous_steps.append(front_rgb_image)
-
-        transformed_img = transform_eval_pre(self.previous_steps)
-        transformed_img = transform_post(transformed_img)
-
-        #replay_video = np.array(self.previous_steps)
-        #replay_video = torch.cat(self.previous_steps)
-        #replay_video = replay_video.unsqueeze(0)
-        #replay_video = replay_video.unsqueeze(1)
-        replay_video = transformed_img
-
-        convert_tensor = transforms.ToTensor()
-
-        #replay_video = convert_tensor(replay_video)
-        replay_video = torch.cat(replay_video)
-        #input_tensor = torch.autograd.Variable(torch.rand(5, 3, 72, 84, 84))
-        print(replay_video.shape)
-        classifier_output = self.classifier_model(replay_video)
-
-        print(classifier_output.shape)
+                print(classifier_output.shape)
+                raise Exception
 
         reward = float(success) if task_reward is None else task_reward
         return self._scene.get_observation(), reward, terminate
